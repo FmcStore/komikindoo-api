@@ -1,0 +1,827 @@
+#!/usr/bin/env python3
+"""REST API untuk komikindo.ch.
+
+Baca dari SQLite hasil scraper.py (offline-first), dengan fallback live ke JSON
+API resmi situs untuk urutan yang tidak disimpan lokal (populer, latest update).
+
+    python3 server.py --host 127.0.0.1 --port 8797
+
+Python 3.10+, stdlib saja.
+"""
+
+import argparse
+import json
+import os
+import threading
+import time
+import urllib.parse
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+import store
+import scraper
+
+VERSION = "1.0.0"
+HERE = os.path.dirname(os.path.abspath(__file__))
+DB_PATH = store.DB_PATH
+UPSTREAM = "https://komikindo.ch/"
+
+SORTS = {
+    "latest": "MAX(c.id) DESC",
+    "chapters": "s.chapter_count DESC, s.title COLLATE NOCASE",
+    "title": "s.title COLLATE NOCASE",
+    "score": "CAST(s.score AS REAL) DESC",
+    "score_asc": "CAST(s.score AS REAL) ASC",
+    "newest": "CAST(s.id AS INTEGER) DESC",
+    "oldest": "CAST(s.id AS INTEGER) ASC",
+}
+TYPES = ["Manga", "Manhwa", "Manhua"]
+STATUSES = ["Ongoing", "Completed", "Hiatus"]
+MAX_PER_PAGE = 100
+
+_db_lock = threading.Lock()
+
+
+def db():
+    """Koneksi read-only per request (thread-safe, tidak pernah menulis)."""
+    return store.connect(DB_PATH, ro=True)
+
+
+def now_ms():
+    return int(time.time() * 1000)
+
+
+class ApiError(Exception):
+    def __init__(self, code, message):
+        super().__init__(message)
+        self.code = code
+        self.message = message
+
+
+_REQUIRED = object()
+
+
+def as_int(v, name, default=_REQUIRED, lo=None, hi=None):
+    if v is None or v == "":
+        if default is _REQUIRED:
+            raise ApiError(400, "parameter '%s' wajib diisi" % name)
+        return default
+    try:
+        n = int(str(v).strip())
+    except ValueError:
+        raise ApiError(400, "parameter '%s' harus angka, dapat %r" % (name, v))
+    if lo is not None and n < lo:
+        n = lo
+    if hi is not None and n > hi:
+        n = hi
+    return n
+
+
+def one_of(v, name, allowed):
+    if v is None or v == "":
+        return None
+    lv = str(v).strip().lower()
+    for a in allowed:
+        if a.lower() == lv:
+            return a
+    raise ApiError(400, "%s=%r tidak dikenal. pilihan: %s" % (name, v, ", ".join(allowed)))
+
+
+# --------------------------------------------------------------------- queries
+
+SERIES_COLS = """s.id, s.slug, s.title, s.type, s.status, s.score, s.cover, s.img,
+                 s.chapter_count, s.latest_chapter"""
+
+
+def series_row(r, full=False):
+    d = {
+        "id": r["id"],
+        "slug": r["slug"],
+        "title": r["title"],
+        "type": r["type"],
+        "status": r["status"],
+        "score": r["score"] if r["score"] is None else _float_or_str(r["score"]),
+        "cover": r["cover"] or r["img"],
+        "thumbnail": r["img"],
+        "chapterCount": r["chapter_count"],
+        "latestChapter": r["latest_chapter"],
+        "url": "/api/series/%s" % (r["slug"] or r["id"]),
+        "webUrl": "https://komikindo.ch/komik/%s/" % r["slug"] if r["slug"] else None,
+    }
+    if full:
+        d.update({
+            "synopsis": r["synopsis"],
+            "released": r["released"],
+            "author": store.jload(r["author"]),
+            "genres": store.jload(r["genre"]),
+            "demographic": store.jload(r["demographic"]),
+            "themes": store.jload(r["theme"]),
+            "contentTags": store.jload(r["content_tags"]),
+            "detailScrapedAt": r["detail_at"],
+        })
+    return d
+
+
+def _float_or_str(v):
+    try:
+        return float(v)
+    except (TypeError, ValueError):
+        return v
+
+
+def build_filters(q, type_, status, genre, demographic, theme, min_ch, max_ch):
+    where, args, joins = [], [], ""
+    if q:
+        where.append("s.title LIKE ? COLLATE NOCASE")
+        args.append("%" + q + "%")
+    if type_:
+        where.append("s.type = ?")
+        args.append(type_)
+    if status:
+        where.append("s.status = ?")
+        args.append(status)
+    if min_ch is not None:
+        where.append("s.chapter_count >= ?")
+        args.append(min_ch)
+    if max_ch is not None:
+        where.append("s.chapter_count <= ?")
+        args.append(max_ch)
+    for kind, val in (("genres", genre), ("demographic", demographic), ("theme", theme)):
+        if val:
+            where.append(
+                "EXISTS (SELECT 1 FROM series_genres g WHERE g.series_id=s.id "
+                "AND g.kind=? AND (g.slug=? OR LOWER(g.name)=?))"
+            )
+            args += [kind, val.lower(), val.lower()]
+    return where, args
+
+
+def query_series(conn, **kw):
+    page = kw.get("page") or 1
+    per_page = kw.get("per_page") or 24
+    sort = kw.get("sort") or "latest"
+    where, args = build_filters(
+        kw.get("q"), kw.get("type"), kw.get("status"), kw.get("genre"),
+        kw.get("demographic"), kw.get("theme"), kw.get("min_chapters"),
+        kw.get("max_chapters"),
+    )
+    clause = (" WHERE " + " AND ".join(where)) if where else ""
+    order = SORTS[sort]
+    total = conn.execute(
+        "SELECT COUNT(*) n FROM series s" + clause, args
+    ).fetchone()["n"]
+    sql = (
+        "SELECT s.* FROM series s LEFT JOIN chapters c ON c.series_id=s.id%s "
+        "GROUP BY s.id ORDER BY %s LIMIT ? OFFSET ?" % (clause, order)
+    )
+    rows = conn.execute(sql, args + [per_page, (page - 1) * per_page]).fetchall()
+    return [series_row(r, full=True) for r in rows], total
+
+
+def resolve_series(conn, key, live=False):
+    """Terima id numerik, slug asli, atau slug hasil slugify judul."""
+    key = urllib.parse.unquote(str(key)).strip()
+    row = None
+    if key.isdigit():
+        row = conn.execute("SELECT * FROM series WHERE id=?", (key,)).fetchone()
+    if row is None:
+        row = conn.execute("SELECT * FROM series WHERE slug=?", (key,)).fetchone()
+    if row is None:
+        # cocokkan slug hasil slugify judul (mis. 'solo-leveling' untuk
+        # '229848-solo-leveling'), plus pencarian longgar
+        cand = conn.execute(
+            "SELECT * FROM series WHERE LOWER(slug)=LOWER(?) OR LOWER(slug) LIKE ? "
+            "OR LOWER(title)=LOWER(?) ORDER BY detail_at DESC LIMIT 5",
+            (key, "%" + key.lower() + "%", key.replace("-", " ")),
+        ).fetchall()
+        if cand:
+            row = cand[0]
+    if row is not None and (dict(row).get("detail_at") or not live):
+        return dict(row)
+    if live or row is None:
+        st, data = scraper.get_json("apk/v2/manga/%s" % key) if key.isdigit() else (0, None)
+        if st == 200 and isinstance(data, list) and data:
+            rec, groups, chapters = scraper.parse_detail(key, data[0])
+            return {
+                "id": rec["id"], "slug": rec["slug"], "title": rec["title"],
+                "type": rec["type"], "status": rec["status"], "score": rec["score"],
+                "cover": rec["cover"], "img": rec["img"], "synopsis": rec["synopsis"],
+                "released": rec["released"], "author": rec["author"],
+                "genre": rec["genre"], "demographic": rec["demographic"],
+                "theme": rec["theme"], "content_tags": rec["content_tags"],
+                "chapter_count": rec["chapter_count"],
+                "latest_chapter": rec["latest_chapter"], "detail_at": rec["detail_at"],
+                "_chapters": chapters,
+            }
+    if row is None:
+        raise ApiError(404, "series %r tidak ada di database maupun upstream" % key)
+    return dict(row)
+
+
+def chapters_of(conn, series_id, order="desc"):
+    rows = conn.execute(
+        "SELECT id, number, sort, url, download FROM chapters WHERE series_id=? "
+        "ORDER BY sort %s" % ("DESC" if order == "desc" else "ASC"),
+        (series_id,),
+    ).fetchall()
+    out = []
+    for r in rows:
+        out.append({
+            "chapterId": r["id"],
+            "number": r["number"],
+            "sort": r["sort"],
+            "url": "/api/chapters/%d" % r["id"],
+            "download": r["download"] or "https://dl.komikcdn.me/?id=%d" % r["id"],
+        })
+    return out
+
+
+def enriched(row):
+    """Tambahkan slug/id lokal ke item upstream (url-nya pakai kmkindo.click)."""
+    d = dict(row)
+    sid = store.chapter_id_from_url(d.get("url"))
+    d["id"] = str(sid) if sid else None
+    d["chapterCount"] = _int_or_none(d.get("chapter"))
+    d.pop("chapter", None)
+    return d
+
+
+def _int_or_none(v):
+    try:
+        return int(str(v))
+    except (TypeError, ValueError):
+        return None
+
+
+def upstream_items(conn, path, enrich=True):
+    st, j = scraper.get_json(path)
+    if st != 200 or not isinstance(j, list):
+        raise ApiError(502, "/%s tidak bisa dibaca dari upstream (HTTP %s)" % (path, st))
+    out = []
+    for x in j:
+        d = enriched(x) if enrich else x
+        if d.get("id"):
+            r = conn.execute(
+                "SELECT slug, chapter_count, latest_chapter FROM series WHERE id=?",
+                (d["id"],),
+            ).fetchone()
+            if r:
+                d["slug"] = r["slug"]
+                d["url"] = "/api/series/%s" % (r["slug"] or d["id"])
+                d["webUrl"] = ("https://komikindo.ch/komik/%s/" % r["slug"]
+                               if r["slug"] else None)
+        d.setdefault("url", None)
+        out.append(d)
+    return out
+
+
+# -------------------------------------------------------------------- handlers
+
+def h_index(env):
+    return {"name": "KomikIndo REST API", "version": VERSION,
+            "endpoints": ENDPOINTS, "upstream": UPSTREAM,
+            "docs": "GET /api", "note": "Semua data real hasil scrape komikindo.ch"}
+
+
+def h_api(env):
+    conn = env["conn"]
+    c = lambda sql, *a: conn.execute(sql, a).fetchone()[0]
+    return {
+        "name": "KomikIndo REST API",
+        "version": VERSION,
+        "upstream": UPSTREAM,
+        "envelope": {"ok": True, "cached": "bool", "elapsedMs": "int",
+                     "source": "list dokumen yang dibaca", "data": "payload"},
+        "catalog": {
+            "series": c("SELECT COUNT(*) FROM series"),
+            "seriesWithDetail": c("SELECT COUNT(*) FROM series WHERE detail_at>0"),
+            "chapters": c("SELECT COUNT(*) FROM chapters"),
+            "chaptersWithImages": c("SELECT COUNT(*) FROM chapter_images"),
+            "genres": c("SELECT COUNT(DISTINCT slug) FROM series_genres WHERE kind='genres'"),
+            "lastCatalogAt": store.get_meta(conn, "catalog_at"),
+            "lastDetailsAt": store.get_meta(conn, "details_at"),
+            "lastImagesAt": store.get_meta(conn, "images_at"),
+        },
+        "enums": {"sort": list(SORTS), "type": TYPES, "status": STATUSES},
+        "endpoints": ENDPOINTS,
+    }
+
+
+def h_health(env):
+    conn = env["conn"]
+    n = conn.execute("SELECT COUNT(*) FROM series").fetchone()[0]
+    return {"status": "ok" if n else "empty", "version": VERSION,
+            "db": os.path.basename(DB_PATH), "series": n,
+            "uptimeSec": int(time.time() - STARTED)}
+
+
+def h_stats(env):
+    conn = env["conn"]
+    q = lambda sql: [dict(r) for r in conn.execute(sql)]
+    return {
+        "series": conn.execute("SELECT COUNT(*) FROM series").fetchone()[0],
+        "seriesWithDetail": conn.execute(
+            "SELECT COUNT(*) FROM series WHERE detail_at>0").fetchone()[0],
+        "chapters": conn.execute("SELECT COUNT(*) FROM chapters").fetchone()[0],
+        "chaptersWithImages": conn.execute(
+            "SELECT COUNT(*) FROM chapter_images").fetchone()[0],
+        "imageUrls": conn.execute(
+            "SELECT COALESCE(SUM(json_array_length(images)),0) FROM chapter_images"
+        ).fetchone()[0],
+        "byType": q("SELECT type, COUNT(*) n FROM series GROUP BY type ORDER BY n DESC"),
+        "byStatus": q("SELECT status, COUNT(*) n FROM series WHERE status IS NOT NULL "
+                      "GROUP BY status ORDER BY n DESC"),
+        "topGenres": q("SELECT name, slug, COUNT(*) n FROM series_genres "
+                       "WHERE kind='genres' GROUP BY slug ORDER BY n DESC LIMIT 50"),
+        "timestamps": {
+            "catalogAt": store.get_meta(conn, "catalog_at"),
+            "slugAt": store.get_meta(conn, "slug_at"),
+            "detailsAt": store.get_meta(conn, "details_at"),
+            "imagesAt": store.get_meta(conn, "images_at"),
+        },
+        "dbSizeMB": round(os.path.getsize(DB_PATH) / 1048576, 1)
+        if os.path.exists(DB_PATH) else 0,
+    }
+
+
+def h_series(env):
+    p = env["params"]
+    conn = env["conn"]
+    sort = (p.get("sort") or ["latest"])[0]
+    sort = one_of(sort, "sort", list(SORTS)) or "latest"
+    items, total = query_series(
+        conn,
+        q=(p.get("q") or [None])[0],
+        type=one_of((p.get("type") or [None])[0], "type", TYPES),
+        status=one_of((p.get("status") or [None])[0], "status", STATUSES),
+        genre=(p.get("genre") or [None])[0],
+        demographic=(p.get("demographic") or [None])[0],
+        theme=(p.get("theme") or [None])[0],
+        min_chapters=as_int((p.get("min_chapters") or [None])[0], "min_chapters", None, 0),
+        max_chapters=as_int((p.get("max_chapters") or [None])[0], "max_chapters", None, 0),
+        page=as_int((p.get("page") or [None])[0], "page", 1, 1),
+        per_page=as_int((p.get("per_page") or [None])[0], "per_page", 24, 1, MAX_PER_PAGE),
+        sort=sort,
+    )
+    env["source"] = [UPSTREAM + "wp-json/apk/v2/list", "sqlite://series"]
+    return {"items": items, "pagination": pagination(env, total)}
+
+
+def pagination(env, total):
+    p = env["params"]
+    page = as_int((p.get("page") or [None])[0], "page", 1, 1)
+    per_page = as_int((p.get("per_page") or [None])[0], "per_page", 24, 1, MAX_PER_PAGE)
+    return {
+        "page": page, "perPage": per_page, "total": total,
+        "totalPages": max(1, -(-total // per_page)), "hasNext": page * per_page < total,
+    }
+
+
+def _norm_row(row):
+    """dict dari DB -> dict dengan list/list ter-parse (bukan string JSON)."""
+    d = dict(row)
+    for k in ("author", "genre", "demographic", "theme", "content_tags"):
+        if isinstance(d.get(k), str):
+            d[k] = store.jload(d[k])
+    return d
+
+
+def h_series_detail(env):
+    conn = env["conn"]
+    key = env["vars"]["key"]
+    live = env["query"].get("live") in ("1", "true", "yes")
+    row = _norm_row(resolve_series(conn, key, live=live))
+    sid = str(row["id"])
+    ch = row.get("_chapters") or chapters_of(conn, sid)
+    slug = row.get("slug")
+    data = {
+        "id": sid,
+        "slug": slug,
+        "title": row.get("title"),
+        "type": row.get("type"),
+        "status": row.get("status"),
+        "score": _float_or_str(row.get("score")),
+        "cover": row.get("cover") or row.get("img"),
+        "thumbnail": row.get("img"),
+        "synopsis": row.get("synopsis"),
+        "released": row.get("released"),
+        "author": row.get("author") or [],
+        "genres": row.get("genre") or [],
+        "demographic": row.get("demographic") or [],
+        "themes": row.get("theme") or [],
+        "contentTags": row.get("content_tags") or [],
+        "detailScrapedAt": row.get("detail_at"),
+        "chapterCount": len(ch),
+        "latestChapter": ch[0]["number"] if ch else None,
+        "firstChapter": ch[-1] if ch else None,
+        "lastChapter": ch[0] if ch else None,
+        "chapters": ch,
+        "chaptersDesc": ch,
+        "chaptersAsc": list(reversed(ch)),
+        "imagesScraped": conn.execute(
+            "SELECT COUNT(*) FROM chapter_images WHERE series_id=?", (sid,)
+        ).fetchone()[0],
+        "url": "/api/series/%s" % (slug or sid),
+        "webUrl": "https://komikindo.ch/komik/%s/" % slug if slug else None,
+    }
+    env["source"] = [UPSTREAM + "wp-json/apk/v2/manga/" + sid, "sqlite://series"]
+    return data
+
+
+def h_series_chapters(env):
+    conn = env["conn"]
+    row = resolve_series(conn, env["vars"]["key"])
+    ch = row.get("_chapters") or chapters_of(conn, row["id"])
+    total = len(ch)
+    page = as_int((env["params"].get("page") or [None])[0], "page", 1, 1)
+    per = as_int((env["params"].get("per_page") or [None])[0], "per_page", 100, 1, 500)
+    env["source"] = ["sqlite://chapters"]
+    return {"seriesId": str(row["id"]), "title": row["title"],
+            "items": ch[(page - 1) * per: page * per],
+            "pagination": {"page": page, "perPage": per, "total": total,
+                           "totalPages": max(1, -(-total // per))}}
+
+
+def _chapter_payload(conn, cid, with_images=True):
+    row = conn.execute(
+        "SELECT * FROM chapter_images WHERE chapter_id=?", (cid,)
+    ).fetchone()
+    meta = conn.execute("SELECT * FROM chapters WHERE id=?", (cid,)).fetchone()
+    if row is None and meta is None:
+        st, j = scraper.get_json("apk/v2/chapter/%d" % cid)
+        if st != 200 or not isinstance(j, dict):
+            raise ApiError(404, "chapter %s tidak ada di database maupun upstream" % cid)
+        env_source = "upstream"
+        return {"chapterId": cid, "seriesId": None, "title": j.get("title"),
+                "number": str(j.get("chapter")),
+                "images": dedup(j.get("image") or []),
+                "imageCount": len(dedup(j.get("image") or [])),
+                "prev": prev_of(conn, None, None), "next": j.get("next"),
+                "webUrl": j.get("link"), "download": j.get("download"),
+                "source": env_source}
+    series_id = (row["series_id"] if row else meta["series_id"])
+    number = row["number"] if row else meta["number"]
+    sib = conn.execute(
+        "SELECT id, number, sort FROM chapters WHERE series_id=? ORDER BY sort ASC",
+        (series_id,),
+    ).fetchall()
+    nums = [(r["id"], str(r["number"])) for r in sib]
+    idx = next((i for i, (i2, _) in enumerate(nums) if i2 == cid), None)
+    prev = None if idx is None or idx == 0 else {
+        "chapterId": nums[idx - 1][0], "number": nums[idx - 1][1],
+        "url": "/api/chapters/%d" % nums[idx - 1][0]}
+    nxt = None if idx is None or idx >= len(nums) - 1 else {
+        "chapterId": nums[idx + 1][0], "number": nums[idx + 1][1],
+        "url": "/api/chapters/%d" % nums[idx + 1][0]}
+    srow = conn.execute("SELECT title, slug FROM series WHERE id=?",
+                        (series_id,)).fetchone()
+    imgs = store.jload(row["images"]) if row else []
+    return {
+        "chapterId": cid,
+        "seriesId": str(series_id),
+        "seriesTitle": srow["title"] if srow else None,
+        "seriesSlug": srow["slug"] if srow else None,
+        "title": row["title"] if row else None,
+        "number": number,
+        "images": imgs if with_images else None,
+        "imageCount": len(imgs),
+        "prev": prev,
+        "next": nxt,
+        "webUrl": "https://komikindo.ch/%s-chapter-%s/" % (
+            srow["slug"].split("-", 1)[-1] if srow and srow["slug"] else "", number)
+        if srow else None,
+        "download": meta["download"] if meta else None,
+        "imagesScraped": bool(row),
+    }
+
+
+def prev_of(conn, series_id, number):
+    return None
+
+
+def dedup(seq):
+    seen, out = set(), []
+    for u in seq:
+        if u and u not in seen:
+            seen.add(u)
+            out.append(u)
+    return out
+
+
+def h_chapter(env):
+    conn = env["conn"]
+    cid = as_int(env["vars"]["cid"], "chapterId", None, 1)
+    d = _chapter_payload(conn, cid)
+    d.pop("source", None)
+    env["source"] = ["sqlite://chapter_images", UPSTREAM + "wp-json/apk/v2/chapter/%d" % cid]
+    return d
+
+
+def h_chapter_images(env):
+    conn = env["conn"]
+    cid = as_int(env["vars"]["cid"], "chapterId", None, 1)
+    d = _chapter_payload(conn, cid)
+    hosts = {}
+    for u in d["images"] or []:
+        h = urllib.parse.urlparse(u).netloc
+        hosts[h] = hosts.get(h, 0) + 1
+    env["source"] = ["sqlite://chapter_images"]
+    return {"chapterId": cid, "seriesId": d.get("seriesId"), "number": d.get("number"),
+            "count": d.get("imageCount"), "hosts": hosts,
+            "images": d.get("images") or []}
+
+
+def h_series_chapter_by_number(env):
+    conn = env["conn"]
+    row = resolve_series(conn, env["vars"]["key"])
+    num = urllib.parse.unquote(env["vars"]["num"])
+    r = conn.execute(
+        "SELECT id FROM chapters WHERE series_id=? AND (number=? OR CAST(sort AS TEXT)=?) "
+        "ORDER BY sort DESC LIMIT 1", (row["id"], num, num),
+    ).fetchone()
+    if r is None:
+        raise ApiError(404, "chapter %r tidak ada di series %s" % (num, row["title"]))
+    d = _chapter_payload(conn, r["id"])
+    d.pop("source", None)
+    env["source"] = ["sqlite://chapters", "sqlite://chapter_images"]
+    return d
+
+
+def h_search(env):
+    conn = env["conn"]
+    q = (env["params"].get("q") or [""])[0].strip()
+    if not q:
+        raise ApiError(400, "parameter 'q' wajib diisi, contoh: /api/search?q=solo")
+    env["source"] = ["sqlite://series"]
+    items, total = query_series(
+        conn, q=q,
+        page=as_int((env["params"].get("page") or [None])[0], "page", 1, 1),
+        per_page=as_int((env["params"].get("per_page") or [None])[0], "per_page", 24, 1, MAX_PER_PAGE),
+        sort=one_of((env["params"].get("sort") or [None])[0], "sort", list(SORTS)) or "score",
+    )
+    if not items:
+        # fallback ke pencarian upstream (katalog lokal belum lengkap)
+        up = upstream_items(conn, "apk/v2/search?s=" + urllib.parse.quote(q))
+        env["source"].append(UPSTREAM + "wp-json/apk/v2/search?s=" + urllib.parse.quote(q))
+        return {"query": q, "items": up, "total": len(up),
+                "pagination": {"page": 1, "perPage": len(up), "total": len(up),
+                               "totalPages": 1, "hasNext": False},
+                "fallback": "upstream"}
+    return {"query": q, "items": items, "pagination": pagination(env, total)}
+
+
+def h_latest(env):
+    conn = env["conn"]
+    page = as_int((env["params"].get("page") or [None])[0], "page", 1, 1, 99)
+    try:
+        items = upstream_items(conn, "apk/v2/latest/%d" % page)
+        env["source"] = [UPSTREAM + "wp-json/apk/v2/latest/%d" % page]
+        return {"items": items, "page": page, "count": len(items), "live": True}
+    except ApiError:
+        items, total = query_series(conn, page=page, per_page=24, sort="latest")
+        env["source"] = ["sqlite://series (proxy, upstream tidak bisa dihubungi)"]
+        return {"items": items, "pagination": pagination(env, total), "live": False}
+
+
+def h_popular(env):
+    conn = env["conn"]
+    page = as_int((env["params"].get("page") or [None])[0], "page", 1, 1, 99)
+    try:
+        items = upstream_items(conn, "apk/v2/terpopuler/%d" % page)
+        env["source"] = [UPSTREAM + "wp-json/apk/v2/terpopuler/%d" % page]
+        return {"items": items, "page": page, "count": len(items), "live": True}
+    except ApiError:
+        items, total = query_series(conn, page=page, per_page=24, sort="score")
+        env["source"] = ["sqlite://series (proxy)"]
+        return {"items": items, "pagination": pagination(env, total), "live": False}
+
+
+def h_recommendations(env):
+    conn = env["conn"]
+    page = as_int((env["params"].get("page") or [None])[0], "page", 1, 1, 99)
+    items = upstream_items(conn, "apk/v2/rekomendasi/%d" % page)
+    env["source"] = [UPSTREAM + "wp-json/apk/v2/rekomendasi/%d" % page]
+    return {"items": items, "page": page, "count": len(items), "live": True}
+
+
+def h_colorized(env):
+    conn = env["conn"]
+    page = as_int((env["params"].get("page") or [None])[0], "page", 1, 1, 99)
+    items = upstream_items(conn, "apk/v2/colorized/1/%d" % page)
+    env["source"] = [UPSTREAM + "wp-json/apk/v2/colorized/1/%d" % page]
+    return {"items": items, "page": page, "count": len(items), "live": True}
+
+
+def h_genres(env):
+    conn = env["conn"]
+    rows = conn.execute(
+        "SELECT kind, name, slug, COUNT(*) n FROM series_genres GROUP BY kind, slug "
+        "ORDER BY kind, n DESC"
+    ).fetchall()
+    out = {}
+    for r in rows:
+        out.setdefault(r["kind"], []).append(
+            {"name": r["name"], "slug": r["slug"], "count": r["n"]})
+    env["source"] = ["sqlite://series_genres"]
+    return {"counts": {k: len(v) for k, v in out.items()}, "groups": out,
+            "genres": out.get("genres", []),
+            "demographic": out.get("demographic", []),
+            "themes": out.get("theme", []), "content": out.get("content", [])}
+
+
+def h_types(env):
+    conn = env["conn"]
+    rows = conn.execute(
+        "SELECT type, COUNT(*) n FROM series GROUP BY type ORDER BY n DESC").fetchall()
+    env["source"] = ["sqlite://series"]
+    return {"types": [{"name": r["type"] or "(kosong)", "count": r["n"]} for r in rows],
+            "known": TYPES}
+
+
+def h_random(env):
+    conn = env["conn"]
+    r = conn.execute(
+        "SELECT slug, id FROM series WHERE detail_at>0 ORDER BY RANDOM() LIMIT 1"
+    ).fetchone()
+    if not r:
+        raise ApiError(404, "database masih kosong, jalankan scraper dulu")
+    return resolve_series(conn, r["slug"] or r["id"])
+
+
+def h_refresh(env):
+    """Picu rescrape di background; langsung balas, tidak menunggu."""
+    scope = (env["params"].get("scope") or ["catalog"])[0]
+    if scope not in ("catalog", "details", "images", "all"):
+        raise ApiError(400, "scope=%r tidak dikenal. pilihan: catalog, details, images, all" % scope)
+    if REFRESH["running"]:
+        return {"started": False, "reason": "rescrape lain sedang jalan",
+                "since": REFRESH["since"]}
+    REFRESH.update(running=True, since=int(time.time()), scope=scope)
+
+    def run():
+        try:
+            args = argparse.Namespace(db=DB_PATH, workers=16, limit=0, force=True,
+                                      max_age=0, series=None, skip_images=False)
+            if scope in ("catalog", "all"):
+                scraper.cmd_catalog(args)
+            if scope in ("details", "all"):
+                scraper.cmd_details(args)
+            if scope == "images":
+                scraper.cmd_images(args)
+        finally:
+            REFRESH.update(running=False, done=int(time.time()))
+
+    threading.Thread(target=run, daemon=True, name="refresh").start()
+    env["source"] = ["scraper.py"]
+    return {"started": True, "scope": scope,
+            "status": "GET /api/stats untuk lihat progres"}
+
+
+ENDPOINTS = [
+    {"method": "GET", "path": "/api", "desc": "Katalog endpoint + statistik singkat"},
+    {"method": "GET", "path": "/api/health", "desc": "Status server"},
+    {"method": "GET", "path": "/api/stats", "desc": "Statistik katalog, tipe, status, genre"},
+    {"method": "GET", "path": "/api/series", "desc": "Daftar series. Filter: q, type, status, genre, demographic, theme, min_chapters, max_chapters, sort, page, per_page"},
+    {"method": "GET", "path": "/api/series/{id|slug}", "desc": "Detail lengkap + seluruh daftar chapter. ?live=1 paksa ambil upstream"},
+    {"method": "GET", "path": "/api/series/{id|slug}/chapters", "desc": "Daftar chapter (paginasi)"},
+    {"method": "GET", "path": "/api/series/{id|slug}/chapters/{number}", "desc": "Isi chapter by nomor, mis. /1.1"},
+    {"method": "GET", "path": "/api/chapters/{chapterId}", "desc": "Isi chapter: daftar URL gambar + prev/next"},
+    {"method": "GET", "path": "/api/chapters/{chapterId}/images", "desc": "Hanya array URL gambar + host"},
+    {"method": "GET", "path": "/api/search", "desc": "Cari judul lokal, fallback ke upstream kalau kosong"},
+    {"method": "GET", "path": "/api/latest", "desc": "Rilis terbaru (live upstream, urutan asli)"},
+    {"method": "GET", "path": "/api/popular", "desc": "Terpopuler (live upstream)"},
+    {"method": "GET", "path": "/api/recommendations", "desc": "Rekomendasi (live upstream)"},
+    {"method": "GET", "path": "/api/colorized", "desc": "Judul berwarna/colorized (live upstream)"},
+    {"method": "GET", "path": "/api/genres", "desc": "Semua genre, demographic, theme + jumlah judul"},
+    {"method": "GET", "path": "/api/types", "desc": "Jumlah judul per tipe"},
+    {"method": "GET", "path": "/api/random", "desc": "Satu series acak yang sudah ada detailnya"},
+    {"method": "GET", "path": "/api/refresh", "desc": "Picu rescrape background. ?scope=catalog|details|images|all"},
+]
+
+ROUTES = [
+    ("GET", r"^/api$", h_api),
+    ("GET", r"^/api/$", h_api),
+    ("GET", r"^/api/health$", h_health),
+    ("GET", r"^/api/stats$", h_stats),
+    ("GET", r"^/api/series$", h_series),
+    ("GET", r"^/api/series/([^/]+)$", h_series_detail),
+    ("GET", r"^/api/series/([^/]+)/chapters$", h_series_chapters),
+    ("GET", r"^/api/series/([^/]+)/chapters/([^/]+)$", h_series_chapter_by_number),
+    ("GET", r"^/api/chapters/(\d+)$", h_chapter),
+    ("GET", r"^/api/chapters/(\d+)/images$", h_chapter_images),
+    ("GET", r"^/api/search$", h_search),
+    ("GET", r"^/api/latest$", h_latest),
+    ("GET", r"^/api/popular$", h_popular),
+    ("GET", r"^/api/recommendations$", h_recommendations),
+    ("GET", r"^/api/colorized$", h_colorized),
+    ("GET", r"^/api/genres$", h_genres),
+    ("GET", r"^/api/types$", h_types),
+    ("GET", r"^/api/random$", h_random),
+    ("GET", r"^/api/refresh$", h_refresh),
+]
+
+VARNAMES = {
+    r"^/api/series/([^/]+)$": ["key"],
+    r"^/api/series/([^/]+)/chapters$": ["key"],
+    r"^/api/series/([^/]+)/chapters/([^/]+)$": ["key", "num"],
+    r"^/api/chapters/(\d+)$": ["cid"],
+    r"^/api/chapters/(\d+)/images$": ["cid"],
+}
+
+REFRESH = {"running": False, "since": None, "done": None, "scope": None}
+STARTED = time.time()
+
+
+class Handler(BaseHTTPRequestHandler):
+    server_version = "komikindo-api/" + VERSION
+    protocol_version = "HTTP/1.1"
+
+    def log_message(self, fmt, *a):
+        if self.path not in ("/api/health",):
+            print("[%s] %s" % (time.strftime("%H:%M:%S"), fmt % a), flush=True)
+
+    def _send(self, code, payload, extra_headers=None):
+        body = json.dumps(payload, ensure_ascii=False, indent=2).encode("utf-8")
+        self.send_response(code)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.send_header("Access-Control-Allow-Methods", "GET, OPTIONS")
+        self.send_header("Cache-Control", "no-store")
+        for k, v in (extra_headers or {}).items():
+            self.send_header(k, v)
+        self.end_headers()
+        self.wfile.write(body)
+
+    def do_OPTIONS(self):
+        self.send_response(204)
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.send_header("Access-Control-Allow-Methods", "GET, OPTIONS")
+        self.send_header("Access-Control-Allow-Headers", "*")
+        self.send_header("Content-Length", "0")
+        self.end_headers()
+
+    def do_GET(self):
+        t0 = now_ms()
+        parsed = urllib.parse.urlsplit(self.path)
+        path = parsed.path.rstrip("/") or "/"
+        if not path.startswith("/api"):
+            path = "/api"  # root = katalog endpoint (JSON murni, tanpa UI)
+        query = urllib.parse.parse_qs(parsed.query, keep_blank_values=False)
+        env = {"params": query, "query": {k: v[0] for k, v in query.items()},
+               "vars": {}, "source": []}
+        import re as _re
+        handler = None
+        for method, pattern, fn in ROUTES:
+            m = _re.match(pattern, path)
+            if m:
+                handler = fn
+                names = VARNAMES.get(pattern)
+                if names:
+                    for n, v in zip(names, m.groups()):
+                        env["vars"][n] = v
+                break
+        if handler is None:
+            self._send(404, {"ok": False, "error": {
+                "code": 404, "message": "route %r tidak ada. lihat GET /api" % path}})
+            return
+        conn = None
+        try:
+            conn = db()
+            env["conn"] = conn
+            data = handler(env)
+            self._send(200, {"ok": True, "cached": False,
+                             "elapsedMs": now_ms() - t0,
+                             "source": env["source"] or None, "data": data})
+        except ApiError as e:
+            self._send(e.code, {"ok": False, "elapsedMs": now_ms() - t0,
+                                "error": {"code": e.code, "message": e.message}})
+        except Exception as e:
+            self._send(500, {"ok": False, "elapsedMs": now_ms() - t0,
+                             "error": {"code": 500, "message": "%s: %s" % (type(e).__name__, e)}})
+        finally:
+            if conn is not None:
+                conn.close()
+
+
+def main():
+    global DB_PATH
+    ap = argparse.ArgumentParser(description="KomikIndo REST API")
+    ap.add_argument("--host", default="127.0.0.1")
+    ap.add_argument("--port", type=int, default=8797)
+    ap.add_argument("--db", default=DB_PATH)
+    a = ap.parse_args()
+    DB_PATH = a.db
+    store.init(DB_PATH)
+    if not os.path.exists(DB_PATH):
+        print("DB belum ada, jalankan: python3 scraper.py catalog")
+    srv = ThreadingHTTPServer((a.host, a.port), Handler)
+    srv.daemon_threads = True
+    print("KomikIndo REST API %s di http://%s:%d  (db=%s)" % (VERSION, a.host, a.port, DB_PATH))
+    try:
+        srv.serve_forever()
+    except KeyboardInterrupt:
+        pass
+
+
+if __name__ == "__main__":
+    main()

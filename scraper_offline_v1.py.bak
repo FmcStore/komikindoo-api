@@ -1,0 +1,482 @@
+#!/usr/bin/env python3
+"""Dump lengkap komikindo.ch ke SQLite.
+
+Sumber: JSON API resmi situs (WordPress + namespace /apk/v2), jadi tidak ada
+parsing HTML sama sekali.
+
+Contoh:
+    python3 scraper.py catalog --workers 16     # 9.103 judul + slug
+    python3 scraper.py details --workers 24     # detail + seluruh daftar chapter
+    python3 scraper.py images  --workers 24     # isi gambar tiap chapter (resumable)
+    python3 scraper.py refresh --workers 8      # rescrape: judul baru + detail basi
+    python3 scraper.py status
+    python3 scraper.py all                      # catalog -> details -> images
+"""
+
+import argparse
+import json
+import os
+import queue
+import random
+import sys
+import threading
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+
+import store
+
+BASE = "https://komikindo.ch/wp-json/"
+UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+      "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36")
+DETAIL_MAX_AGE = 7 * 86400  # detail dianggap basi setelah 7 hari
+
+_lock = threading.Lock()
+_wlock = threading.Lock()   # serialisasi tulis DB: satu koneksi sqlite dipakai
+                            # bareng banyak thread, transaksi tidak boleh tumpang tindih
+_stat = {"ok": 0, "err": 0, "bytes": 0}
+
+
+def get_json(path, timeout=60, tries=4, base=BASE):
+    """GET JSON dengan retry + backoff. Mengembalikan (status, objek|None)."""
+    url = path if path.startswith("http") else base + path
+    last = None
+    for attempt in range(tries):
+        req = urllib.request.Request(
+            url,
+            headers={
+                "User-Agent": UA,
+                "Accept": "application/json, text/plain, */*",
+                "Accept-Language": "id-ID,id;q=0.9,en;q=0.8",
+                "Referer": "https://komikindo.ch/",
+            },
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=timeout) as r:
+                body = r.read()
+                with _lock:
+                    _stat["bytes"] += len(body)
+                return r.status, json.loads(body.decode("utf-8", "replace"))
+        except urllib.error.HTTPError as e:
+            last = "HTTP %s" % e.code
+            if e.code in (404, 400):
+                try:
+                    return e.code, json.loads(e.read().decode("utf-8", "replace"))
+                except Exception:
+                    return e.code, None
+        except Exception as e:  # timeout, reset, dns, dsb
+            last = str(e)[:80]
+        time.sleep(min(8, 0.6 * (attempt + 1)) + random.random() * 0.4)
+    return 0, {"error": last}
+
+
+def log(msg):
+    sys.stderr.write("%s %s\n" % (time.strftime("%H:%M:%S"), msg))
+    sys.stderr.flush()
+
+
+# ---------------------------------------------------------------- normalisasi
+
+def norm_term_list(lst):
+    return [{"name": n, "slug": s} for n, s in store.terms(lst)]
+
+
+def norm_author(lst):
+    out = []
+    for a in lst or []:
+        if isinstance(a, dict):
+            out.append({"name": (a.get("name") or "").strip(), "link": a.get("link") or ""})
+        else:
+            out.append({"name": str(a).strip(), "link": ""})
+    return [a for a in out if a["name"]]
+
+def parse_detail(series_id, d):
+    """Ubah respons /apk/v2/manga/{id}[0] jadi record series + rows chapter."""
+    chapters = []
+    for ch in d.get("data") or []:
+        cid = store.chapter_id_from_url(ch.get("url"))
+        if not cid:
+            continue
+        chapters.append({
+            "id": cid,
+            "number": ch.get("chapter"),
+            "url": ch.get("url"),
+            "download": ch.get("download"),
+        })
+    chapters.sort(key=lambda c: store.chapter_num_to_sort(c["number"]), reverse=True)
+    latest = chapters[0]["number"] if chapters else None
+
+    groups = {
+        "genres": store.terms(d.get("genre")),
+        "demographic": store.terms(d.get("demographic")),
+        "theme": store.terms(d.get("theme")),
+        "content": store.terms(d.get("content")),
+    }
+    title = (d.get("title") or "").strip()
+    rec = {
+        "id": str(series_id),
+        "slug": store.slugify(title),
+        "title": title,
+        "type": d.get("type") or None,
+        "status": d.get("status") or None,
+        "score": d.get("score") or None,
+        "cover": d.get("cover") or None,
+        "img": d.get("img") or None,
+        "synopsis": (d.get("synopsis") or "").strip() or None,
+        "released": d.get("released") or None,
+        "author": store.jdump(norm_author(d.get("author"))),
+        "genre": store.jdump(norm_term_list(d.get("genre"))),
+        "demographic": store.jdump(norm_term_list(d.get("demographic"))),
+        "theme": store.jdump(norm_term_list(d.get("theme"))),
+        "content_tags": store.jdump(norm_term_list(d.get("content"))),
+        "chapter_count": len(chapters),
+        "latest_chapter": latest,
+        "detail_at": int(time.time()),
+    }
+    return rec, groups, chapters
+
+
+def parse_list_item(x):
+    sid = store.chapter_id_from_url(x.get("url"))
+    title = (x.get("title") or "").strip()
+    return {
+        "id": str(sid) if sid else None,
+        "slug": store.slugify(title),
+        "title": title,
+        "type": x.get("type") or None,
+        "score": x.get("score") or None,
+        "img": x.get("img") or None,
+        "chapter_count": int(x["chapter"]) if str(x.get("chapter") or "").isdigit() else 0,
+        "latest_chapter": x.get("chapter") if not str(x.get("chapter") or "").isdigit() else None,
+        "list_at": int(time.time()),
+    }
+
+
+# ------------------------------------------------------------------ pengumpul
+
+def fetch_series_ids(conn, only_missing=False, stale_after=None):
+    q = "SELECT id,title FROM series"
+    where, args = [], []
+    if only_missing:
+        where.append("detail_at=0")
+    if stale_after:
+        where.append("detail_at<?")
+        args.append(int(time.time()) - stale_after)
+    if where:
+        q += " WHERE " + " AND ".join(where)
+    q += " ORDER BY id"
+    return [dict(r) for r in conn.execute(q, args)]
+
+
+def parallel(items, worker_fn, workers=16, label="item", flush=None, flush_every=400):
+    """worker_fn(item) dijalankan di N thread. flush(batch) dipanggil tiap
+    flush_every hasil supaya memori tidak menumpuk (dataset-nya ratusan ribu baris)."""
+    q = queue.Queue()
+    for it in items:
+        q.put(it)
+    total = len(items)
+    done = [0]
+    buf = []
+
+    def run():
+        while True:
+            try:
+                it = q.get_nowait()
+            except queue.Empty:
+                return
+            drained = None
+            try:
+                r = worker_fn(it)
+                if r is not None:
+                    if flush:
+                        # NB: flush() TIDAK boleh dipanggil sambil memegang _lock.
+                        # flush() sendiri mengunci _lock, dan Lock bukan reentrant.
+                        with _lock:
+                            buf.append(r)
+                            if len(buf) >= flush_every:
+                                drained, buf[:] = list(buf), []
+                    else:
+                        with _lock:
+                            buf.append(r)
+            except Exception as e:
+                with _lock:
+                    _stat["err"] += 1
+                log("  ! %s: %s" % (label, e))
+            finally:
+                with _lock:
+                    done[0] += 1
+                    if done[0] % 250 == 0 or done[0] == total:
+                        log("  %s %d/%d (ok=%d err=%d)" % (label, done[0], total,
+                                                           _stat["ok"], _stat["err"]))
+                q.task_done()
+            if drained:
+                flush(drained)
+
+    threads = [threading.Thread(target=run, daemon=True) for _ in range(workers)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    if flush:
+        if buf:
+            flush(list(buf))
+        return None
+    return buf
+
+
+# -------------------------------------------------------------------- perintah
+
+def cmd_catalog(args):
+    conn = store.init(args.db)
+    st, data = get_json("apk/v2/list")
+    if st != 200 or not isinstance(data, list):
+        log("gagal ambil /apk/v2/list: %s %s" % (st, str(data)[:120]))
+        return 1
+    log("katalog upstream: %d judul" % len(data))
+    rows, n = [], 0
+    for x in data:
+        rec = parse_list_item(x)
+        if not rec["id"]:
+            continue
+        rows.append(rec)
+        n += 1
+    # upsert tanpa menimpa kolom detail
+    cols = ("id", "slug", "title", "type", "score", "img", "list_at")
+    conn.executemany(
+        "INSERT INTO series(%s) VALUES(%s) ON CONFLICT(id) DO UPDATE SET %s"
+        % (",".join(cols), ",".join("?" * len(cols)),
+           ",".join("%s=excluded.%s" % (c, c) for c in cols if c != "id")),
+        [[r.get(c) for c in cols] for r in rows],
+    )
+    store.set_meta(conn, "catalog_at", int(time.time()))
+    store.set_meta(conn, "catalog_count", n)
+    conn.commit()
+    log("tersimpan %d judul" % n)
+
+    # slug asli dari /wp/v2/manga (94 request) supaya URL publik bisa dicari
+    try:
+        page, mapped = 1, 0
+        while page <= 200:
+            st, rows2 = get_json("wp/v2/manga?per_page=100&page=%d&_fields=id,slug,title,link"
+                                 % page)
+            if st != 200 or not isinstance(rows2, list) or not rows2:
+                break
+            for r in rows2:
+                t = (r.get("title") or {}).get("rendered") or ""
+                before = conn.total_changes
+                conn.execute(
+                    "UPDATE series SET slug=?, title=? WHERE title=? AND slug=?",
+                    (r["slug"], t, t, store.slugify(t)),
+                )
+                mapped += conn.total_changes - before
+            page += 1
+            if len(rows2) < 100:
+                break
+        store.set_meta(conn, "slug_at", int(time.time()))
+        conn.commit()
+        log("slug asli dipetakan untuk %d judul" % mapped)
+    except Exception as e:
+        log("slug mapping dilewati: %s" % e)
+
+    c = conn.execute("SELECT COUNT(*) n FROM series").fetchone()["n"]
+    log("total series di DB: %d" % c)
+    conn.close()
+    return 0
+
+
+def cmd_details(args):
+    conn = store.init(args.db)
+    todo = fetch_series_ids(conn, only_missing=not args.force,
+                            stale_after=args.max_age)
+    if args.limit:
+        todo = todo[: args.limit]
+    log("detail: %d series antre" % len(todo))
+    if not todo:
+        conn.close()
+        return 0
+
+    def work(item):
+        sid = item["id"]
+        st, data = get_json("apk/v2/manga/%s" % sid)
+        if st != 200 or not isinstance(data, list) or not data:
+            with _lock:
+                _stat["err"] += 1
+            return None
+        rec, groups, chapters = parse_detail(sid, data[0])
+        return rec, groups, chapters
+
+    def flush(batch):
+        """Commit per batch: scraper 9rb series tidak boleh tahan satu transaksi."""
+        with _wlock:
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                for rec, groups, chapters in batch:
+                    store.upsert_series(conn, rec)
+                    store.replace_chapters(conn, rec["id"], [
+                        (c["id"], rec["id"], c["number"],
+                         store.chapter_num_to_sort(c["number"]), c["url"], c["download"])
+                        for c in chapters
+                    ])
+                    store.replace_genres(conn, rec["id"], groups)
+                conn.commit()
+            except Exception:
+                conn.rollback()
+                raise
+        with _lock:
+            _stat["ok"] += len(batch)
+
+    parallel(todo, work, workers=args.workers, label="detail",
+             flush=flush, flush_every=300)
+    store.set_meta(conn, "details_at", int(time.time()))
+    conn.commit()
+    log("selesai. ok=%d err=%d" % (_stat["ok"], _stat["err"]))
+    conn.close()
+    return 0
+
+
+def cmd_images(args):
+    conn = store.init(args.db)
+    q = ("SELECT c.id, c.series_id, c.number FROM chapters c "
+         "LEFT JOIN chapter_images i ON i.chapter_id=c.id WHERE i.chapter_id IS NULL")
+    if args.series:
+        q += " AND c.series_id=?"
+        todo = [dict(r) for r in conn.execute(q + " ORDER BY c.id", (args.series,))]
+    else:
+        todo = [dict(r) for r in conn.execute(q + " ORDER BY c.id")]
+    if args.limit:
+        todo = todo[: args.limit]
+    log("gambar chapter: %d antre" % len(todo))
+    if not todo:
+        conn.close()
+        return 0
+
+    def work(item):
+        cid = item["id"]
+        st, j = get_json("apk/v2/chapter/%d" % cid)
+        if st != 200 or not isinstance(j, dict) or not j.get("image"):
+            with _lock:
+                _stat["err"] += 1
+            return None
+        # dedup sambil jaga urutan
+        seen, imgs = set(), []
+        for u in j["image"]:
+            if u and u not in seen:
+                seen.add(u)
+                imgs.append(u)
+        return {
+            "chapter_id": cid,
+            "series_id": item["series_id"],
+            "number": str(j.get("chapter") or item["number"]),
+            "title": j.get("title"),
+            "images": store.jdump(imgs),
+            "prev": j.get("prev"),
+            "next": j.get("next"),
+            "fetched_at": int(time.time()),
+        }
+
+    def flush(batch):
+        with _wlock:
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                conn.executemany(
+                    "INSERT OR REPLACE INTO chapter_images"
+                    "(chapter_id,series_id,number,title,images,prev,next,fetched_at) "
+                    "VALUES(:chapter_id,:series_id,:number,:title,:images,:prev,:next,:fetched_at)",
+                    batch,
+                )
+                conn.commit()
+            except Exception:
+                conn.rollback()
+                raise
+        with _lock:
+            _stat["ok"] += len(batch)
+
+    parallel(todo, work, workers=args.workers, label="chapter",
+             flush=flush, flush_every=300)
+    store.set_meta(conn, "images_at", int(time.time()))
+    conn.commit()
+    log("selesai. ok=%d err=%d" % (_stat["ok"], _stat["err"]))
+    conn.close()
+    return 0
+
+
+def cmd_refresh(args):
+    """Rescrape ringan: katalog baru, lalu detail yang baru/basi saja."""
+    log("== refresh: katalog ==")
+    cmd_catalog(args)
+    log("== refresh: detail baru/basi ==")
+    args.max_age = 0 if not hasattr(args, "max_age") or args.max_age is None else args.max_age
+    return cmd_details(args)
+
+
+def cmd_status(args):
+    conn = store.init(args.db)
+    def one(sql, *a):
+        r = conn.execute(sql, a).fetchone()
+        return r[0] if r else 0
+    n_series = one("SELECT COUNT(*) FROM series")
+    n_det = one("SELECT COUNT(*) FROM series WHERE detail_at>0")
+    n_ch = one("SELECT COUNT(*) FROM chapters")
+    n_img = one("SELECT COUNT(*) FROM chapter_images")
+    n_slug = one("SELECT COUNT(*) FROM series WHERE slug IS NOT NULL AND slug!=''")
+    print(json.dumps({
+        "db": args.db,
+        "sizeMB": round(os.path.getsize(args.db) / 1048576, 1) if os.path.exists(args.db) else 0,
+        "series": n_series,
+        "seriesWithDetail": n_det,
+        "seriesWithSlug": n_slug,
+        "chapters": n_ch,
+        "chaptersWithImages": n_img,
+        "imagesPending": n_ch - n_img,
+        "catalogAt": store.get_meta(conn, "catalog_at"),
+        "detailsAt": store.get_meta(conn, "details_at"),
+        "imagesAt": store.get_meta(conn, "images_at"),
+        "genres": one("SELECT COUNT(DISTINCT slug) FROM series_genres"),
+    }, indent=1))
+    conn.close()
+    return 0
+
+
+def main():
+    p = argparse.ArgumentParser(description="Dump komikindo.ch ke SQLite")
+    p.add_argument("--db", default=store.DB_PATH)
+    p.add_argument("--workers", type=int, default=16)
+    sub = p.add_subparsers(dest="cmd", required=True)
+
+    def common(sp):
+        sp.add_argument("--db", default=store.DB_PATH)
+        sp.add_argument("--workers", type=int, default=16)
+        sp.add_argument("--limit", type=int, default=0)
+        return sp
+
+    common(sub.add_parser("catalog"))
+    d = common(sub.add_parser("details"))
+    d.add_argument("--force", action="store_true", help="ambil ulang walau sudah ada")
+    d.add_argument("--max-age", type=int, default=DETAIL_MAX_AGE, dest="max_age")
+    i = common(sub.add_parser("images"))
+    i.add_argument("--series", default=None)
+    r = common(sub.add_parser("refresh"))
+    r.add_argument("--max-age", type=int, default=0, dest="max_age")
+    sub.add_parser("status").add_argument("--db", default=store.DB_PATH)
+    a = common(sub.add_parser("all"))
+    a.add_argument("--skip-images", action="store_true")
+
+    args = p.parse_args()
+    store.init(args.db)
+    t0 = time.time()
+    fn = {"catalog": cmd_catalog, "details": cmd_details, "images": cmd_images,
+          "refresh": cmd_refresh, "status": cmd_status}[args.cmd]
+    if args.cmd == "all":
+        rc = cmd_catalog(args)
+        rc |= cmd_details(args)
+        if not args.skip_images:
+            rc |= cmd_images(args)
+    else:
+        rc = fn(args)
+    log("selesai dalam %.1fs (ok=%d err=%d)" % (time.time() - t0, _stat["ok"], _stat["err"]))
+    return rc
+
+
+if __name__ == "__main__":
+    sys.exit(main() or 0)

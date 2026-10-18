@@ -1,0 +1,6 @@
+# quick tunnel Cloudflare untuk KomikIndo API (tanpa kredensial akun).
+# JANGAN set key `tunnel:` / `credentials-file:` di file ini:
+# cloudflared akan masuk mode named-tunnel dan gagal "Unauthorized: Tunnel not found".
+# Target backend diambil dari --url di unit file.
+ingress:
+  - service: http_status:404

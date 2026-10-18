@@ -1,0 +1,7 @@
+tunnel: 64d6055b-faa2-43ff-98a2-67421c5b0d74
+credentials-file: /root/.cloudflared/64d6055b-faa2-43ff-98a2-67421c5b0d74.json
+
+ingress:
+  - hostname: komikindo.aoxi.my.id
+    service: http://127.0.0.1:8797
+  - service: http_status:404

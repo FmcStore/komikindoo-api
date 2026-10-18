@@ -1,0 +1,204 @@
+"""SQLite storage untuk komikindo-api.
+
+Dipakai bareng oleh scraper.py (writer) dan server.py (reader).
+Python 3.10+, stdlib saja.
+"""
+
+import json
+import os
+import re
+import sqlite3
+import unicodedata
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+DATA_DIR = os.path.join(HERE, "data")
+DB_PATH = os.path.join(DATA_DIR, "komikindo.db")
+
+SCHEMA = """
+PRAGMA journal_mode=WAL;
+
+CREATE TABLE IF NOT EXISTS series(
+  id            TEXT PRIMARY KEY,
+  slug          TEXT,
+  title         TEXT NOT NULL,
+  alt_title     TEXT,
+  type          TEXT,
+  status        TEXT,
+  score         TEXT,
+  cover         TEXT,
+  img           TEXT,
+  synopsis      TEXT,
+  released      TEXT,
+  author        TEXT,
+  genre         TEXT,
+  demographic   TEXT,
+  theme         TEXT,
+  content_tags  TEXT,
+  chapter_count INTEGER DEFAULT 0,
+  latest_chapter TEXT,
+  detail_at     INTEGER DEFAULT 0,
+  list_at       INTEGER DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS idx_series_title  ON series(title);
+CREATE INDEX IF NOT EXISTS idx_series_slug   ON series(slug);
+CREATE INDEX IF NOT EXISTS idx_series_type   ON series(type);
+CREATE INDEX IF NOT EXISTS idx_series_detail ON series(detail_at);
+
+CREATE TABLE IF NOT EXISTS chapters(
+  id         INTEGER PRIMARY KEY,
+  series_id  TEXT NOT NULL,
+  number     TEXT,
+  sort       REAL,
+  url        TEXT,
+  download   TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_ch_series ON chapters(series_id, sort);
+
+CREATE TABLE IF NOT EXISTS chapter_images(
+  chapter_id INTEGER PRIMARY KEY,
+  series_id  TEXT,
+  number     TEXT,
+  title      TEXT,
+  images     TEXT,
+  prev       TEXT,
+  next       TEXT,
+  fetched_at INTEGER
+);
+CREATE INDEX IF NOT EXISTS idx_ci_series ON chapter_images(series_id, number);
+
+CREATE TABLE IF NOT EXISTS series_genres(
+  series_id TEXT NOT NULL,
+  kind      TEXT NOT NULL,
+  name      TEXT NOT NULL,
+  slug      TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_sg_genre  ON series_genres(kind, slug);
+CREATE INDEX IF NOT EXISTS idx_sg_series ON series_genres(series_id);
+
+CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY, value TEXT);
+"""
+
+
+def slugify(s):
+    s = unicodedata.normalize("NFKD", s or "").encode("ascii", "ignore").decode()
+    s = re.sub(r"[^\w\s-]", "", s).strip().lower()
+    s = re.sub(r"[\s_-]+", "-", s)
+    return re.sub(r"^-+|-+$", "", s)
+
+
+def connect(path=DB_PATH, ro=False):
+    if ro:
+        conn = sqlite3.connect("file:%s?mode=ro" % path, uri=True, timeout=30,
+                               check_same_thread=False)
+    else:
+        conn = sqlite3.connect(path, timeout=120, check_same_thread=False)
+        conn.execute("PRAGMA busy_timeout=120000")
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA synchronous=NORMAL")
+    conn.row_factory = sqlite3.Row
+    return conn
+
+
+def init(path=DB_PATH):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    c = connect(path)
+    c.executescript(SCHEMA)
+    c.commit()
+    return c
+
+
+def jload(v, default=None):
+    if v is None or v == "":
+        return default if default is not None else []
+    try:
+        return json.loads(v)
+    except Exception:
+        return default if default is not None else []
+
+
+def jdump(v):
+    if v is None:
+        return None
+    return json.dumps(v, ensure_ascii=False)
+
+
+def terms(lst):
+    """Ubah list terminologi upstream [{name,link}] jadi [(name, slug)]."""
+    out = []
+    for t in lst or []:
+        if isinstance(t, dict):
+            name = (t.get("name") or "").strip()
+            slug = slugify(name)
+        else:
+            name, slug = str(t).strip(), slugify(str(t))
+        if name:
+            out.append((name, slug))
+    return out
+
+
+def set_meta(conn, key, value):
+    conn.execute(
+        "INSERT INTO meta(key,value) VALUES(?,?) "
+        "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+        (key, str(value)),
+    )
+
+
+def get_meta(conn, key, default=None):
+    r = conn.execute("SELECT value FROM meta WHERE key=?", (key,)).fetchone()
+    return r["value"] if r else default
+
+
+def upsert_series(conn, rec):
+    """rec: dict hasil normalisasi."""
+    cols = (
+        "id", "slug", "title", "alt_title", "type", "status", "score", "cover",
+        "img", "synopsis", "released", "author", "genre", "demographic", "theme",
+        "content_tags", "chapter_count", "latest_chapter", "detail_at", "list_at",
+    )
+    vals = [rec.get(c) for c in cols]
+    sets = ", ".join("%s=excluded.%s" % (c, c) for c in cols if c != "id")
+    conn.execute(
+        "INSERT INTO series(%s) VALUES(%s) ON CONFLICT(id) DO UPDATE SET %s"
+        % (",".join(cols), ",".join("?" * len(cols)), sets),
+        vals,
+    )
+
+
+def replace_chapters(conn, series_id, rows):
+    conn.execute("DELETE FROM chapters WHERE series_id=?", (series_id,))
+    conn.executemany(
+        "INSERT OR REPLACE INTO chapters(id,series_id,number,sort,url,download) "
+        "VALUES(?,?,?,?,?,?)",
+        rows,
+    )
+
+
+def replace_genres(conn, series_id, groups):
+    """groups: {"genres":[(n,s)], "demographic":[...], "theme":[...], "content":[...]}"""
+    conn.execute("DELETE FROM series_genres WHERE series_id=?", (series_id,))
+    rows = []
+    for kind, items in groups.items():
+        for name, slug in items:
+            rows.append((series_id, kind, name, slug))
+    if rows:
+        conn.executemany(
+            "INSERT INTO series_genres(series_id,kind,name,slug) VALUES(?,?,?,?)", rows
+        )
+
+
+def chapter_num_to_sort(num):
+    if num is None:
+        return 0.0
+    m = re.search(r"\d+(?:\.\d+)?", str(num))
+    try:
+        return float(m.group(0)) if m else 0.0
+    except Exception:
+        return 0.0
+
+
+def chapter_id_from_url(url):
+    if not url:
+        return None
+    m = re.search(r"[?&]id=(\d+)", url)
+    return int(m.group(1)) if m else None
